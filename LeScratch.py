@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+
 from __future__ import division
 import os
 import re
@@ -10,10 +11,20 @@ import string
 import signal
 import socket
 import binascii
+import datetime
 from Tkinter import Tk
 from array import array
 import RPi.GPIO as GPIO
+import step_motor as StepMotor
+import RTC_DS1307
+import DHTreader
+import IOboard
 
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(True)
+
+stepM1 = StepMotor.Motor(11,7,16,26)
+stepM2 = StepMotor.Motor(4,25,24,23)
 
 root = Tk()
 root.withdraw()
@@ -21,21 +32,42 @@ root.withdraw()
 Bus = smbus.SMBus(2)
 PORT = 42001
 HOST = "localhost"
-Sent = 0
-Finished = 0
-Failed = 0
-Debug = False
 
+Debug = False
 Connected = False
 Setup = False
 I2Csetup = False
 
 I2Inputs = []
 SPInputs = []
+
+# GPIO
 GPIOset = [False] * 35
 GPIOdir = ["OUT"] * 35
+
+# LNdigital
 LNout = [False] * 8
 LNin = [False] * 8
+
+# UltraSonic
+GPIO_Trigger = 0
+GPIO_Echo = 0
+
+# DHT
+temperature = 0
+humidity = 0
+
+# Sound Detect
+soundPin = 0
+
+# Touch Detect
+touchPin = 0
+
+# Tilt Detect
+tiltPin = 0
+
+# Light Sensor
+lightPin = 0
 
 # MCP23S17
 SPI_SLAVE_ADDR = 0x40
@@ -72,20 +104,25 @@ SPI_SCLK = 11 # Serial-Clock
 SPI_MOSI = 10 # Master-Out-Slave-In
 SPI_MISO = 9  # Master-In-Slave-Out
 SPI_CS0 = 8   # Chip-Select
-
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(True)
                    
 LedPattern = ("0b00000001", "0b00000010", "0b00000100", "0b00001000", \
               "0b00010000", "0b00100000", "0b01000000", "0b10000000")
 
 Addons = {
-    "RTC": False,
-    "0x20": False,
-    "0x21": False,
-    "0x22": False,
-    "I2CButton": False,
     "LNdigital": False,
+    "USB_HUB": False,
+    "IOboard": False,
+    "StepMotor": False,
+    "RTC": False,
+    "LCD1602": False,
+    "LCD1602MSG": False,
+    "UltraSonic": False,
+    "DHTreader": False,
+    "PCF8591": False,
+    "SoundDetect": False,
+    "TouchSensor": False,
+    "TiltSensor": False,
+    "LightSensor": False,
 }
 
 
@@ -168,41 +205,7 @@ def SPIread(opcode, addr):
     return value
 
         
-def sendCmd(cmd):
-    n = len(cmd)
-    a = array('c')
-    a.append(chr((n >> 24) & 0xFF))
-    a.append(chr((n >> 16) & 0xFF))
-    a.append(chr((n >> 8) & 0xFF))
-    a.append(chr(n & 0xFF))
-    Socket.send(a.tostring() + cmd)
-
-
-def LNout_update(Pin, status):
-    if status == "ON":
-        New = int(LedPattern[Pin], 2)
-        Old = int('{:08}'.format(SPIread(SPI_SLAVE_ADDR, SPI_GPIOA)))
-        Bin = bin(Old | New)
-    elif status == "OFF":
-        New = ~int(LedPattern[Pin], 2)
-        Old = int('{:08}'.format(SPIread(SPI_SLAVE_ADDR, SPI_GPIOA)))
-        Bin = bin(Old & New)
-
-    SPIsend(SPI_SLAVE_ADDR, SPI_GPIOA, int(Bin, 2))
-
-        
-##################################################################################
-
-
-def RtcTest():
-    try:
-        Bus.read_byte_data(0x68, 0x00)# To wake it up if is sleeping.
-        Read = Bus.read_byte_data(0x68, 0x00)
-        if Read != 0x00:
-            Addons["RTC"] = True
-    except:
-        Addons["RTC"] = False
-
+#################################################################################
 
 def I2CButton():
     try:
@@ -242,11 +245,10 @@ def LNdigital():
             Addons["LNdigital"] = False
     except:
         Addons["LNdigital"] = False
-        
+           
 
 def Check():
     if not Connected:
-        RtcTest()
         I2CButton()
         LNdigital()
         Finished = 0
@@ -277,6 +279,9 @@ def List():
     for Key, Value in Addons.iteritems():
         print(Key)
   
+        
+##################################################################################
+
 
 def I2CsetFunc():
     Address = [0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27]
@@ -288,7 +293,65 @@ def I2CsetFunc():
         except:
             print (str(Addr) + " not availible.")
 
-            
+
+def sendCmd(cmd):
+    n = len(cmd)
+    a = array('c')
+    a.append(chr((n >> 24) & 0xFF))
+    a.append(chr((n >> 16) & 0xFF))
+    a.append(chr((n >> 8) & 0xFF))
+    a.append(chr(n & 0xFF))
+    Socket.send(a.tostring() + cmd)
+
+
+def LNout_update(Pin, status):
+    if status == "ON":
+        New = int(LedPattern[Pin], 2)
+        Old = int('{:08}'.format(SPIread(SPI_SLAVE_ADDR, SPI_GPIOA)))
+        Bin = bin(Old | New)
+    elif status == "OFF":
+        New = ~int(LedPattern[Pin], 2)
+        Old = int('{:08}'.format(SPIread(SPI_SLAVE_ADDR, SPI_GPIOA)))
+        Bin = bin(Old & New)
+
+    SPIsend(SPI_SLAVE_ADDR, SPI_GPIOA, int(Bin, 2))
+
+
+def calDistance(trigger, echo):
+    stop = start = 0
+    GPIO.setup(trigger, GPIO.OUT)
+    GPIO.setup(echo, GPIO.IN)
+    GPIO.output(trigger, 0)
+    time.sleep(0.5)
+    
+    GPIO.output(trigger, 1)
+    time.sleep(0.00001)
+    GPIO.output(trigger, 0)
+    start = time.time()
+    while GPIO.input(echo) == 0:
+        start = time.time()
+
+    while GPIO.input(echo) == 1:
+        stop = time.time()
+
+    delta = stop - start
+    print("UltraSonic time %.8f" % (delta))
+    distance = delta * 34300
+    distance = distance / 2.0
+    GPIO.cleanup()
+    return distance
+
+
+def soundDetect(soundPin):
+    LED = 9
+    GPIO.setup(LED, GPIO.OUT)
+    GPIO.output(LED, 0)  
+    print("Sound detect on GPIO %d is %d" %(soundPin, GPIO.input(soundPin)))
+    sendCmd("sensor-update soundDetect %d" % (GPIO.input(soundPin)))
+    time.sleep(30)
+    GPIO.output(LED, 1)
+
+
 #################################################################################
 
 
@@ -321,7 +384,6 @@ if __name__ == '__main__':
         Connect()
     List()
 
-
     SPIsend(SPI_SLAVE_ADDR, SPI_IOCONA, 0x0A)
     SPIsend(SPI_SLAVE_ADDR, SPI_IOCONB, 0x0A)
 
@@ -345,7 +407,10 @@ if __name__ == '__main__':
       
     SPIsend(SPI_SLAVE_ADDR, SPI_OLATA, 0x00)
     SPIsend(SPI_SLAVE_ADDR, SPI_OLATB, 0xFF)
-    
+
+    address = 0x48
+    IOboard.init(address)
+                        
     LastMsg = time.time()
 
     while True:
@@ -409,11 +474,31 @@ if __name__ == '__main__':
 
                 for A in range(len(Data)):
    
-                    if Data[A] == "RTC":
+                    if Data[A] == "RTC" and not Addons["RTC"]:
                         Addons["RTC"] = True
-                        os.system("clear")
-                        List()                                
+                        print("Real Time Clock is added.")
 
+                    if Data[A] == "ULTRASONIC" and not Addons["UltraSonic"]:
+                        Addons["UltraSonic"] = True
+                        print("UltraSonic device is added.")
+
+                    if Data[A] == "PCF8591" and not Addons["PCF8591"]:
+                        Addons["PCF8591"] = True
+                        print("PCF8591 A/D D/A converter is added.")
+
+                    if Data[A] == "LCD1602" and not Addons["LCD1602"]:
+                        Addons["LCD1602"] = True
+                        LCDhandler = IOboard.initLCD(2, 16, 8)
+                        IOboard.clearLCD(LCDhandler)
+                        print("LCD1602 to display is added.")
+                        
+                    if Data[A] == "LCD1602MSG" and not Addons["LCD1602MSG"]:
+                        Addons["LCD1602MSG"] = True
+                        LCDhandler = IOboard.initLCD(2, 16, 8)
+                        IOboard.clearLCD(LCDhandler)
+                        print("LCD1602 can now show messages.")
+
+     
                     if Data[A] == "UPDATE":
 
                         for B in SPInputs:
@@ -486,12 +571,68 @@ if __name__ == '__main__':
                                         sendCmd("sensor-update GPIO-{0} {1}".format(i, Input))
                         except:
                             print("Failed")
-                                                                           
 
+                        if Addons["RTC"]:
+                            DS1307 = RTC_DS1307.RTC_DS1307(2, 0x68)
+                            DS1307.write_now()
+                            currenttime = datetime.datetime.utcnow()
+                            print("DS1307 = \t\t%s" % DS1307.read_datetime())
+                            print("System Time = \t" + time.strftime("%Y-%m-%d %H:%M:%S"))
+    
+                            sendCmd("sensor-update Day " + str(DS1307._read_day()))
+                            sendCmd("sensor-update Date " + str(DS1307._read_date()))
+                            sendCmd("sensor-update Month " + str(DS1307._read_month()))
+                            sendCmd("sensor-update Year " + str(DS1307._read_year()))
+                            sendCmd("sensor-update Hour " + str(DS1307._read_hours()))
+                            sendCmd("sensor-update Minutes " + str(DS1307._read_minutes()))
+                            sendCmd("sensor-update Seconds " + str(DS1307._read_seconds()))
+
+                        if Addons["LCD1602"]:                        
+                            IOboard.clearLCD(LCDhandler)
+                            msgL1 = "20" + str(DS1307._read_year()) + "-" + str(DS1307._read_month()) + "-" + str(DS1307._read_date())
+                            msgL2 = str(DS1307._read_hours()) + ":" + str(DS1307._read_minutes()) + ":" + str(DS1307._read_seconds())
+                            IOboard.writeLCD(LCDhandler, 0, 0, msgL1)
+                            IOboard.writeLCD(LCDhandler, 0, 1, msgL2)
+                            msgL3 = str(int(temperature)) + " 'C"
+                            msgL4 = str(int(humidity)) + " RH"                       
+                            IOboard.writeLCD(LCDhandler, 11, 0, msgL3)
+                            IOboard.writeLCD(LCDhandler, 11, 1, msgL4)
+                            
+                        if Addons["UltraSonic"]:
+                            distance = calDistance(GPIO_Trigger, GPIO_Echo)
+                            print("The distance measurement of UltraSonic: {0}".format(distance))
+                            sendCmd("sensor-update UltraSonic %.2f" % (distance))
+
+                        if Addons["DHTreader"]:
+                            try:
+                                temperature, humidity = DHTreader.read(typeDHT, pinDHT)
+                                if temperature and humidity:
+                                    print("Temperature = {0} *C, Humidity = {1} %".format(temperature, humidity))
+                                    sendCmd("sensor-update Temperature %.2f" % (temperature))
+                                    sendCmd("sensor-update Humidity %.2f" % (humidity))                                       
+                                else:
+                                    print("Failed to read from sensor, restart.")
+                            except:
+                                print("Failed to read from sensor, restart.")
+                                
+                        if Addons["TouchSensor"]:
+                            GPIO.setup(touchPin, GPIO.IN, GPIO.PUD_DOWN)
+                            print("Touch detect on GPIO %d is %d" %(touchPin, GPIO.input(touchPin)))
+                            sendCmd("sensor-update touchSensor %d" % (GPIO.input(touchPin)))
+
+                        if Addons["TiltSensor"]:
+                            GPIO.setup(tiltPin, GPIO.IN, GPIO.PUD_DOWN)
+                            print("Tilt detect on GPIO %d is %d" %(tiltPin, GPIO.input(tiltPin)))
+                            sendCmd("sensor-update tiltSensor %d" % (GPIO.input(tiltPin)))                            
+
+                        if Addons["LightSensor"]:
+                            GPIO.setup(lightPin, GPIO.IN, GPIO.PUD_DOWN)
+                            print("Light detect on GPIO %d is %d" %(lightPin, GPIO.input(lightPin)))
+                            sendCmd("sensor-update lightSensor %d" % (GPIO.input(lightPin)))
+                            
                 if Data[0] == "SENSOR-UPDATE":
                     Data[0] = ""
                 for A in range(len(Data)):
-                    PinsOff = re.findall(r'PINSOFF', Data[A])
                     Spi = re.findall(r'SP(\d)(\D)(\d)', Data[A])
                     SpiIn = re.findall(r'SP(\d)(A|B)IN', Data[A])                    
                     Bits = re.findall(r'BITS(\d)(\D)(\d+)', Data[A])
@@ -502,18 +643,34 @@ if __name__ == '__main__':
                     Bit2 = re.findall(r'BIT(\d+)(\D+)(ON|OFF|CLR)', Data[A])
                     Data2 = re.findall(r'G(\d+)(\D+)', Data[A])
                     LNDI = re.findall(r'LNDI(\d+)(\D+)', Data[A])
-
-                    if PinsOff:
-                        Pins = [
-                        4, 7, 8, 9, 10, 11, 17, 18, 22,
-                        23, 24, 25, 27, 28, 29, 30, 31
-                        ]
-                        for A in Pins:
-                            try:
-                                GPIO.output(A, 0)
-                            except:
-                                continue
-
+                    StepM1 = re.findall(r'^STEPMAINIT', Data[A])
+                    StepM2 = re.findall(r'^STEPMBINIT', Data[A])
+                    StepMode = re.findall(r'^STEPMODE(\d+)([A|B])', Data[A])                    
+                    StepM = re.findall(r'STEPM(\d+)([A|B])(\d+)([P|N])', Data[A])
+                    Trigger = re.findall(r'TRIGGER(\d+)', Data[A])
+                    Echo = re.findall(r'ECHO(\d+)', Data[A])
+                    DHT = re.findall(r'DHT(\d+)PIN(\d+)', Data[A])
+                    AD = re.findall(r'AD(\d+)READ', Data[A])
+                    DA = re.findall(r'DA(\d+)WRITE', Data[A])
+                    Sound = re.findall(r'SOUND(\d+)', Data[A])
+                    Touch = re.findall(r'TOUCH(\d+)', Data[A])
+                    Tilt = re.findall(r'TILT(\d+)', Data[A])
+                    Light = re.findall(r'LIGHT(\d+)AIN(\d+)', Data[A])  
+                    Message = re.findall(r'MSG1602(\D+)', Data[A])
+                    
+                    if Message and Addons["LCD1602MSG"]:
+                        Message = Message[0]
+                        lenMSG = len(Message)                        
+                        print(Message)
+                        IOboard.clearLCD(LCDhandler)
+                        if lenMSG < 16:
+                            IOboard.writeLCD(LCDhandler, 0, 0, Message)
+                        elif lenMSG < 32:
+                            IOboard.writeLCD(LCDhandler, 0, 0, Message)
+                            IOboard.writeLCD(LCDhandler, 0, 1, Message[16:lenMSG])
+                        else:
+                            print("LCD can't display more than 32 characters.")
+        
                     if Spi:
                         Spi = Spi[0]
                         Chip = int(Spi[0])
@@ -540,8 +697,7 @@ if __name__ == '__main__':
                         Led = int(Spi[2])
                         Bin = int(LedPattern[Led], 2)
                         SPIsend(int(Addr, 16), Reg, Bin)
-
-                        
+                
                     if SpiIn:
                         In = SpiIn[0]
                         Chip = In[0]
@@ -556,7 +712,6 @@ if __name__ == '__main__':
                         if (Hex, Bank) not in SPInputs:
                             print("Added :", Hex, Bank)
                             SPInputs.append((Hex, Bank))
-
 
                     if Bits:
                         Bits = Bits[0]
@@ -581,7 +736,6 @@ if __name__ == '__main__':
                         if Debug:
                             print(Addr, Bank, Bin)
                         SPIsend(int(Addr, 16), Bank, int(Bin, 2))
-
                             
                     if Bits2:
                         Bits2 = Bits2[0]
@@ -611,7 +765,6 @@ if __name__ == '__main__':
 
                         SPIsend(int(Addr, 16), Bank, Bin)
 
-
                     if I2C:
                         if not I2Csetup:
                             I2CsetFunc()
@@ -632,7 +785,6 @@ if __name__ == '__main__':
                             print (Read)
                         Bus.write_byte_data(int("0x"+Addr, 16), Reg, Read ^ Bin)
 
-
                     if I2cIn:
                         In = I2cIn[0]
                         Chip = hex(int(In[0]) + 32)
@@ -646,7 +798,6 @@ if __name__ == '__main__':
                             print("Already in Inputs.")
                         else:
                             I2Inputs.append((Chip, Bank))
-
 
                     if Bit:
                         Addr = Bit[0][0]
@@ -666,7 +817,6 @@ if __name__ == '__main__':
                         else:
                             if Debug:
                                 print("Incorrect Bank enter in Bit command.")
-
                                 
                     if Bit2:
                         Addr = Bit2[0][0]
@@ -689,7 +839,6 @@ if __name__ == '__main__':
                                 Bus.write_byte_data(int("0x"+Addr, 16), 0x13, 0x00)
                                 Bus.write_byte_data(int("0x"+Addr, 16), 0x19, 0x00)         
 
-
                     if Data2:
                         Data2 = Data2[0]
                         Pin = int(Data2[0])
@@ -707,12 +856,13 @@ if __name__ == '__main__':
                             GPIO.setup(Pin, GPIO.IN)
                             print(str(Pin) + " set to IN")
                         if Cmd == "ON" and GPIOset[Pin]:
+                            GPIO.setup(Pin, GPIO.OUT)
                             GPIO.output(Pin, 1)
                             print(str(Pin) + " set to ON")
                         if Cmd == "OFF" and GPIOset[Pin]:
+                            GPIO.setup(Pin, GPIO.OUT)
                             GPIO.output(Pin, 0)
                             print(str(Pin) + " set to OFF")
-
 
                     if LNDI:                    
                         LNDI = LNDI[0]
@@ -732,7 +882,164 @@ if __name__ == '__main__':
                         if Cmd == "OFF" and LNout[Pin]:
                             LNout_update(Pin, "OFF")
                             print("LNDI-" + str(Pin) + " set to OFF")
-                                                    		    
+
+                    if StepM1:
+                        GPIO.setup(11, GPIO.OUT)
+                        GPIO.setup(7, GPIO.OUT)
+                        GPIO.setup(16, GPIO.OUT)
+                        GPIO.setup(26, GPIO.OUT)
+                        stepM1 = StepMotor.Motor(11,7,16,26)
+                        stepM1.init()
+
+                    if StepM2:
+                        GPIO.setup(4, GPIO.OUT)
+                        GPIO.setup(25, GPIO.OUT)
+                        GPIO.setup(24, GPIO.OUT)
+                        GPIO.setup(23, GPIO.OUT)
+                        stepM2 = StepMotor.Motor(4,25,24,23)
+                        stepM2.init()
+
+                    if StepMode:
+                        In = StepMode[0]
+                        mode = int(In[0])
+                        Index = In[1]
+                        Steps = 256
+                        if Index == "A":
+                            if mode == 1:
+                                stepM1.setFullStepDrive()
+                                print("Step Motor A: Full Step Drive")
+                            elif mode == 2:
+                                stepM1.setWaveDrive()
+                                print("Step Motor A: Wave Drive")
+                                
+                            stepM1.turn(Steps, stepM1.CLOCKWISE)
+                            time.sleep(0.1)
+                            stepM1.turn(Steps, stepM1.ANTICLOCKWISE)
+                            time.sleep(0.1)
+                            
+                        elif Index == "B":
+                            if mode == 1:
+                                stepM2.setFullStepDrive()
+                                print("Step Motor B: Full Step Drive")                               
+                            elif mode == 2:
+                                stepM2.setWaveDrive()
+                                print("Step Motor B: Wave Drive")
+
+                            stepM2.turn(Steps, stepM1.CLOCKWISE)
+                            time.sleep(0.1)
+                            stepM2.turn(Steps, stepM1.ANTICLOCKWISE)
+                            time.sleep(0.1)
+                                                              
+                    if StepM:
+                        In = StepM[0]
+                        Speed = int(In[0])
+                        Speed = Speed / 1000.0
+                        stepM1.setSpeed(Speed)
+                        stepM2.setSpeed(Speed)
+                        Index = In[1]
+                        Steps = int(In[2])
+                        Dir = In[3]
+                        if Index == "A":                            
+                            if Dir == "P":
+                                stepM1.turn(Steps, stepM1.CLOCKWISE)
+                                time.sleep(0.1)
+                            elif Dir == "N":
+                                stepM1.turn(Steps, stepM1.ANTICLOCKWISE)
+                                time.sleep(0.1)
+                        elif Index == "B":
+                            if Dir == "P":
+                                stepM2.turn(Steps, stepM2.CLOCKWISE)
+                                time.sleep(0.1)
+                            elif Dir == "N":
+                                stepM2.turn(Steps, stepM2.ANTICLOCKWISE)
+                                time.sleep(0.1)
+
+                    if Trigger:
+                        Trigger = int(Trigger[0])
+                        GPIO_Trigger = Trigger
+                        GPIO.setup(GPIO_Trigger, GPIO.OUT)
+                        print("GPIO {0} is set to trigger".format(Trigger))
+
+                    if Echo:
+                        Echo = int(Echo[0])
+                        GPIO_Echo = Echo
+                        GPIO.setup(GPIO_Echo, GPIO.IN)
+                        print("GPIO {0} is set to echo".format(Echo))
+
+                    if DHT:
+                        DHT = DHT[0]
+                        typeDHT = int(DHT[0])
+                        pinDHT = int(DHT[1])
+
+                        if typeDHT not in [11, 22, 2302]:
+                            print("invalid type, only DHT11, DHT22 and AM2302 are supported.")
+                            sys.exit(3)
+
+                        if pinDHT <= 0 | pinDHT > 40:
+                            print("invalid GPIO pin#")
+                            sys.exit(3)
+
+                        print("Detect on wiringPi PIN #{0} for DHT sensor".format(pinDHT))
+                        
+                        DHTreader.init()
+                        Addons["DHTreader"] = True
+
+                    if AD and Addons["PCF8591"]:
+                        channel = int(AD[0])
+                        if channel in [0, 1, 2, 3]:
+                            value = IOboard.readPCF8591(channel)
+                            inV = 3.3*value/255
+                            print("I2C PCF8591: channel {0} input: {1} voltage.".format(channel, inV))
+                            sendCmd("sensor-update readPCF8591 %.2f" % (inV))
+                        else:
+                            print("I2C PCF8591 should read from channel [0 | 1 | 2 | 3]")
+                                        
+                    if DA and Addons["PCF8591"]:
+                        out = int(DA[0])
+                        IOboard.writePCF8591(out)
+                        outV = 3.3*out/255
+                        print("I2C PCF8591: analog output: {0} voltage.".format(outV))
+                        sendCmd("sensor-update writePCF8591 %.2f" % (outV))
+
+                    if Sound: 
+                        soundPin = int(Sound[0])
+                        try:
+                            GPIO.setup(soundPin, GPIO.IN, GPIO.PUD_DOWN)
+                            print("Sound detect on GPIO %d is %d" %(soundPin, GPIO.input(soundPin)))
+                            GPIO.add_event_detect(soundPin,GPIO.FALLING,callback = soundDetect,bouncetime = 300)
+                        except:
+                            print("Failed to setup the Sound sensor")
+
+                    if Touch:
+                        touchPin = int(Touch[0])
+                        try:
+                            GPIO.setup(touchPin, GPIO.IN, GPIO.PUD_DOWN)
+                            print("Touch detect on GPIO %d is %d" %(touchPin, GPIO.input(touchPin)))
+                            Addons["TouchSensor"] = True
+                        except:
+                            print("Failed to setup the Touch sensor")
+
+                    if Tilt:
+                        tiltPin = int(Tilt[0])
+                        try:
+                            GPIO.setup(tiltPin, GPIO.IN, GPIO.PUD_DOWN)
+                            print("Tilt detect on GPIO %d is %d" %(tiltPin, GPIO.input(tiltPin)))
+                            Addons["TiltSensor"] = True
+                        except:
+                            print("Failed to setup the Tilt sensor")
+
+                    if Light:
+                        Light = Light[0]
+                        lightPin = int(Light[0])
+                        lightAIN = int(Light[1])
+                        try:
+                            GPIO.setup(lightPin, GPIO.IN, GPIO.PUD_DOWN)
+                            print("Light detect on GPIO %d is %d" %(lightPin, GPIO.input(lightPin)))
+                            Addons["LightSensor"] = True
+                        except:
+                            print("Failed to setup the Light sensor")
+
+                                                                                                                
         except KeyboardInterrupt:
             SPIsend(SPI_SLAVE_ADDR, SPI_IOCONA, 0x00)
             SPIsend(SPI_SLAVE_ADDR, SPI_IOCONB, 0x00)
@@ -742,9 +1049,4 @@ if __name__ == '__main__':
             GPIO.cleanup()
             os.system("clear")
             print ("GPIO Cleaned up and exiting.")
-            Sent = "Sent: {0}".format(Sent)
-            Fin = " Finished: {0}".format(Finished)
-            Failed = " Failed: {0}".format(Failed)
-            if Failed == 0:
-                print(Sent + Fin + Failed)
             sys.exit()
